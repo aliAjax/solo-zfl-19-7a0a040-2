@@ -1,5 +1,5 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
+const { readFile, writeFile, mkdir, rename } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3019);
@@ -107,7 +107,22 @@ async function readDb() {
 }
 
 async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+  // 先写临时文件再原子改名，避免并发/崩溃时写坏 db.json
+  const tmpFile = `${DB_FILE}.tmp`;
+  await writeFile(tmpFile, JSON.stringify(data, null, 2));
+  await rename(tmpFile, DB_FILE);
+}
+
+// 变更类请求全局串行化：读—校验—写必须在同一临界区内，
+// 否则两个同发布号派发会同时读到“未派发”并互相覆盖落盘。
+let writeChain = Promise.resolve();
+function withWriteLock(task) {
+  const run = writeChain.then(task, task);
+  writeChain = run.then(
+    () => {},
+    () => {}
+  );
+  return run;
 }
 
 function send(res, status, body) {
@@ -177,6 +192,29 @@ function httpError(status, message) {
   const error = new Error(message);
   error.status = status;
   return error;
+}
+
+// 回执/裁决数值校验：拒绝文本、null、布尔、空串与 Infinity/NaN
+function finiteNumber(value, field, { integer = false } = {}) {
+  if (typeof value === "string" && value.trim() === "") {
+    throw httpError(400, `字段 ${field} 必须是${integer ? "整数" : "有限数字"}，不能为空白文本`);
+  }
+  const num = Number(value);
+  if (value === null || typeof value === "boolean" || !Number.isFinite(num)) {
+    throw httpError(400, `字段 ${field} 必须是${integer ? "整数" : "有限数字"}，收到：${JSON.stringify(value)}`);
+  }
+  if (integer && !Number.isInteger(num)) {
+    throw httpError(400, `字段 ${field} 必须是整数，收到：${JSON.stringify(value)}`);
+  }
+  return num;
+}
+
+function parseReceiptFields(body, fields = ["holeCount", "offsetMm", "tapeLengthMm"]) {
+  const receipt = {};
+  for (const field of fields) {
+    receipt[field] = finiteNumber(body[field], field, { integer: field === "holeCount" });
+  }
+  return receipt;
 }
 
 function parseLaneRange(laneRange) {
@@ -760,15 +798,10 @@ async function handle(req, res) {
     const body = await parseBody(req);
     required(body, ["holeCount", "offsetMm", "tapeLengthMm"]);
     const receipt = {
-      holeCount: Number(body.holeCount),
-      offsetMm: Number(body.offsetMm),
-      tapeLengthMm: Number(body.tapeLengthMm),
+      ...parseReceiptFields(body),
       machineId: body.machineId || (publication.dispatch && publication.dispatch.machineId) || null,
       note: body.note || ""
     };
-    if ([receipt.holeCount, receipt.offsetMm, receipt.tapeLengthMm].some((value) => !Number.isFinite(value))) {
-      return send(res, 400, { error: "回执字段必须是数字" });
-    }
 
     const mismatches = evaluateReceipt(publication, receipt);
     const outcome = recordAcceptance(db, publication, receipt, mismatches, "online");
@@ -827,16 +860,9 @@ async function handle(req, res) {
       pubNo: body.pubNo,
       source: body.source,
       machineId: body.machineId || publication.dispatch.machineId,
-      receipt: {
-        holeCount: Number(body.holeCount),
-        offsetMm: Number(body.offsetMm),
-        tapeLengthMm: Number(body.tapeLengthMm)
-      },
+      receipt: parseReceiptFields(body),
       receivedAt: new Date().toISOString()
     };
-    if (Object.values(record.receipt).some((value) => !Number.isFinite(value))) {
-      return send(res, 400, { error: "回执字段必须是数字" });
-    }
     const existing = db.offlineReceipts.find(
       (item) => item.pubNo === record.pubNo && item.source === record.source
     );
@@ -889,9 +915,12 @@ async function handle(req, res) {
     const sourceOrder = receipts.slice(0, 2);
     const finalReceipt = { ...report.mergedReceipt };
     const resolutions = {};
+    // 第一遍：逐项校验并算出裁决值。任何字段非法都在写入前整体拒绝（400），
+    // 不写合并结果、不写发布版。
+    const pickedValues = {};
     for (const field of report.conflictFields) {
       const decision = body.resolutions && body.resolutions[field];
-      if (decision === undefined) {
+      if (decision === undefined || decision === null) {
         return send(res, 409, {
           error: `字段 ${field} 两个回执不一致，必须在 resolutions.${field} 中逐项定版`,
           mergeReport: report
@@ -899,12 +928,25 @@ async function handle(req, res) {
       }
       if (decision === "a" || decision === "b") {
         const picked = sourceOrder[decision === "a" ? 0 : 1];
-        finalReceipt[field] = field === "machineId" ? picked.machineId : picked.receipt[field];
-        resolutions[field] = { resolvedBy: "source", source: picked.source, value: finalReceipt[field] };
+        pickedValues[field] = {
+          value: field === "machineId" ? picked.machineId : picked.receipt[field],
+          resolution: { resolvedBy: "source", source: picked.source }
+        };
+      } else if (field === "machineId") {
+        pickedValues[field] = {
+          value: String(decision),
+          resolution: { resolvedBy: "manual" }
+        };
       } else {
-        finalReceipt[field] = field === "machineId" ? String(decision) : Number(decision);
-        resolutions[field] = { resolvedBy: "manual", value: finalReceipt[field] };
+        // 文本/NaN/null/布尔/Infinity 在此被拒绝，绝不进入验收比较
+        const value = finiteNumber(decision, field, { integer: field === "holeCount" });
+        pickedValues[field] = { value, resolution: { resolvedBy: "manual" } };
       }
+    }
+    // 第二遍：全部合法后才应用
+    for (const field of report.conflictFields) {
+      finalReceipt[field] = pickedValues[field].value;
+      resolutions[field] = { ...pickedValues[field].resolution, value: finalReceipt[field] };
     }
 
     const mergedRecord = {
@@ -936,8 +978,13 @@ async function handle(req, res) {
   return send(res, 404, { error: "接口不存在", routes });
 }
 
+const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  const run = () => handle(req, res);
+  // 变更类请求串行化：同发布号并发派发时只有一个能通过唯一性检查并落盘
+  const promise = MUTATING_METHODS.has(req.method) ? withWriteLock(run) : run();
+  promise.catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
 });
 
 server.listen(PORT, () => {
