@@ -10,7 +10,7 @@
         "tempoBpm": 82,
         "paperType": "半透明纸带"
       },
-      "createdAt": "2026-06-16T00:00:00.000Z"
+      "createdAt": "2026-09-13T11:44:15.502Z"
     }
   ],
   "sections": [
@@ -43,7 +43,7 @@
       "lane": 12,
       "description": "第41拍高音孔漏打",
       "status": "open",
-      "createdAt": "2026-06-16T00:00:00.000Z",
+      "createdAt": "2026-09-13T11:44:15.503Z",
       "resolvedAt": null
     }
   ]
